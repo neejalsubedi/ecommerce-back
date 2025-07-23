@@ -14,6 +14,10 @@ const productSchema = new mongoose.Schema({
     default: 0,
   },
   image: String,
+  size: {
+    type: [String],
+    enum: ["S", "M", "L", "XL", "XXL", "XXXL"],
+  },
 });
 
 module.exports = mongoose.model("Product", productSchema);

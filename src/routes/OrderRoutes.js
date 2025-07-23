@@ -42,6 +42,11 @@ router.post("/place", authenticate, async (req, res) => {
       items.map(async ({ productId, quantity }) => {
         const product = await Product.findById(productId);
         if (!product) throw new Error("Invalid product in cart");
+        if (product.stock < quantity) {
+          throw new Error(`${product.name} has only ${product.stock} left`);
+        }
+        product.stock -= quantity;
+        await product.save();
         return {
           product: product._id,
           name: product.name,
@@ -63,7 +68,7 @@ router.post("/place", authenticate, async (req, res) => {
       deliveryInfo,
       paymentMethod,
       totalPrice,
-      paymentStatus: "Paid", // COD is auto marked paid
+      paymentStatus: "Pending", // COD is auto marked paid
       transactionUUID: uuidv4(),
     });
 
@@ -89,6 +94,10 @@ router.post("/khalti/initiate", authenticate, async (req, res) => {
       items.map(async ({ productId, quantity }) => {
         const product = await Product.findById(productId);
         if (!product) throw new Error("Invalid product in cart");
+        if (product.stock < quantity) {
+          throw new Error(`${product.name} has only ${product.stock} left`);
+        }
+
         return {
           product: product._id,
           name: product.name,
@@ -144,7 +153,6 @@ router.post("/khalti/initiate", authenticate, async (req, res) => {
   }
 });
 
-
 // GET /api/orders/esewa/success
 router.post("/khalti/verify-and-save", authenticate, async (req, res) => {
   const { pidx, tempOrder } = req.body;
@@ -161,6 +169,17 @@ router.post("/khalti/verify-and-save", authenticate, async (req, res) => {
     );
 
     const data = response.data;
+    for (const item of tempOrder.items) {
+      const product = await Product.findById(item.product);
+
+      if (!product) throw new Error("Invalid product in cart");
+      if (product.stock < item.quantity) {
+        throw new Error(`${product.name} has only ${product.stock} left`);
+      }
+
+      product.stock -= item.quantity;
+      await product.save();
+    }
 
     if (data.status === "Completed") {
       const order = new Order({
@@ -175,7 +194,9 @@ router.post("/khalti/verify-and-save", authenticate, async (req, res) => {
 
       await order.save();
 
-      return res.status(201).json({ message: "Order placed", orderId: order._id });
+      return res
+        .status(201)
+        .json({ message: "Order placed", orderId: order._id });
     } else {
       return res.status(400).json({ message: "Payment not completed" });
     }
@@ -217,6 +238,13 @@ router.put("/:id/cancel", authenticate, async (req, res) => {
           "Order cannot be cancelled as it is already delivered or completed",
       });
     }
+    for (const item of order.items) {
+      const product = await Product.findById(item.product);
+      if (product) {
+        product.stock += item.quantity;
+        await product.save();
+      }
+    }
 
     order.orderStatus = "Cancelled";
     await order.save();
@@ -228,53 +256,65 @@ router.put("/:id/cancel", authenticate, async (req, res) => {
   }
 });
 // Update only the order status (Admin only)
-router.put("/:id/update-order-status", authenticate, authorizeRoles("Admin"), async (req, res) => {
-  try {
-    const { orderStatus } = req.body;
+router.put(
+  "/:id/update-order-status",
+  authenticate,
+  authorizeRoles("Admin"),
+  async (req, res) => {
+    try {
+      const { orderStatus } = req.body;
 
-    if (!orderStatus) {
-      return res.status(400).json({ message: "Order status is required" });
+      if (!orderStatus) {
+        return res.status(400).json({ message: "Order status is required" });
+      }
+
+      const order = await Order.findById(req.params.id);
+
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+
+      order.orderStatus = orderStatus;
+      await order.save();
+
+      return res.status(200).json({ message: "Order status updated", order });
+    } catch (err) {
+      console.error("Order Status Update Error:", err);
+      return res.status(500).json({ message: "Failed to update order status" });
     }
-
-    const order = await Order.findById(req.params.id);
-
-    if (!order) {
-      return res.status(404).json({ message: "Order not found" });
-    }
-
-    order.orderStatus = orderStatus;
-    await order.save();
-
-    return res.status(200).json({ message: "Order status updated", order });
-  } catch (err) {
-    console.error("Order Status Update Error:", err);
-    return res.status(500).json({ message: "Failed to update order status" });
   }
-});
+);
 // Update only the payment status (Admin only)
-router.put("/:id/update-payment-status", authenticate, authorizeRoles("Admin"), async (req, res) => {
-  try {
-    const { paymentStatus } = req.body;
+router.put(
+  "/:id/update-payment-status",
+  authenticate,
+  authorizeRoles("Admin"),
+  async (req, res) => {
+    try {
+      const { paymentStatus } = req.body;
 
-    if (!paymentStatus) {
-      return res.status(400).json({ message: "Payment status is required" });
+      if (!paymentStatus) {
+        return res.status(400).json({ message: "Payment status is required" });
+      }
+
+      const order = await Order.findById(req.params.id);
+
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+
+      order.paymentStatus = paymentStatus;
+      await order.save();
+
+      return res.status(200).json({ message: "Payment status updated", order });
+    } catch (err) {
+      console.error("Payment Status Update Error:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to update payment status" });
     }
-
-    const order = await Order.findById(req.params.id);
-
-    if (!order) {
-      return res.status(404).json({ message: "Order not found" });
-    }
-
-    order.paymentStatus = paymentStatus;
-    await order.save();
-
-    return res.status(200).json({ message: "Payment status updated", order });
-  } catch (err) {
-    console.error("Payment Status Update Error:", err);
-    return res.status(500).json({ message: "Failed to update payment status" });
   }
-});
+);
 // GET all orders (admin only)
 router.get("/all", authenticate, authorizeRoles("Admin"), async (req, res) => {
   try {
