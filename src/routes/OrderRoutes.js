@@ -39,12 +39,13 @@ router.post("/place", authenticate, async (req, res) => {
     }
 
     const orderItems = await Promise.all(
-      items.map(async ({ productId, quantity }) => {
+      items.map(async ({ productId, quantity, size }) => {
         const product = await Product.findById(productId);
         if (!product) throw new Error("Invalid product in cart");
         if (product.stock < quantity) {
           throw new Error(`${product.name} has only ${product.stock} left`);
         }
+        //
         product.stock -= quantity;
         await product.save();
         return {
@@ -52,6 +53,7 @@ router.post("/place", authenticate, async (req, res) => {
           name: product.name,
           price: product.price,
           quantity,
+          size,
           image: product.image,
         };
       })
@@ -83,128 +85,155 @@ router.post("/place", authenticate, async (req, res) => {
     res.status(500).json({ message: "Failed to place COD order" });
   }
 });
-router.post("/khalti/initiate", authenticate, async (req, res) => {
-  const { items, deliveryInfo } = req.body;
-  const userId = req.user.id;
+  router.post("/khalti/initiate", authenticate, async (req, res) => {
+    const { items, deliveryInfo } = req.body;
+    const userId = req.user.id;
 
-  try {
-    if (!items?.length) return res.status(400).json({ message: "Cart empty" });
+    try {
+      if (!items?.length) return res.status(400).json({ message: "Cart empty" });
 
-    const orderItems = await Promise.all(
-      items.map(async ({ productId, quantity }) => {
-        const product = await Product.findById(productId);
+      const orderItems = await Promise.all(
+        items.map(async ({ productId, quantity, size }) => {
+          const product = await Product.findById(productId);
+          if (!product) throw new Error("Invalid product in cart");
+          if (product.stock < quantity) {
+            throw new Error(`${product.name} has only ${product.stock} left`);
+          }
+          //  if (size && (!product.sizes || !product.sizes.includes(size))) {
+          //       throw new Error(`${product.name} is not available in size ${size}`);
+          //     }
+
+          return {
+            product: product._id,
+            name: product.name,
+            price: product.price,
+            quantity,
+            size,
+            image: product.image,
+          };
+        })
+      );
+
+      const totalPrice = orderItems.reduce(
+        (sum, item) => sum + item.price * item.quantity,
+        0
+      );
+
+      const transactionUUID = uuidv4();
+
+      const response = await axios.post(
+        "https://dev.khalti.com/api/v2/epayment/initiate/",
+        {
+          return_url: `http://localhost:5173/payment-success`,
+
+          website_url: "http://localhost:5173",
+          amount: totalPrice * 100,
+          purchase_order_id: transactionUUID,
+          purchase_order_name: "Order via Khalti",
+          customer_info: {
+            name: deliveryInfo.name,
+            email: deliveryInfo.email,
+            phone: deliveryInfo.phone,
+          },
+        },
+        {
+          headers: {
+            Authorization: `Key ${KHALTI_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      return res.status(200).json({
+        ...response.data,
+        tempOrder: {
+          userId,
+          items: orderItems,
+          deliveryInfo,
+          totalPrice,
+          transactionUUID,
+        },
+      });
+    } catch (err) {
+      console.error("Khalti Init Error", err.response?.data || err.message);
+      return res.status(500).json({ message: "Failed to initiate Khalti" });
+    }
+  });
+
+  // GET /api/orders/esewa/success
+  router.post("/khalti/verify-and-save", authenticate, async (req, res) => {
+    const { pidx, tempOrder } = req.body;
+
+    if (!pidx || !tempOrder) {
+      return res.status(400).json({ message: "Missing required data" });
+    }
+
+    try {
+      // Verify with Khalti
+      const response = await axios.post(
+        "https://a.khalti.com/api/v2/epayment/lookup/",
+        { pidx },
+        {
+          headers: {
+            Authorization: `Key ${KHALTI_SECRET_KEY}`,
+          },
+        }
+      );
+
+      const paymentInfo = response.data;
+
+      if (paymentInfo.status !== "Completed") {
+        return res
+          .status(400)
+          .json({ message: "Payment not completed", status: paymentInfo.status });
+      }
+      for (const item of tempOrder.items) {
+        const product = await Product.findById(item.product);
+
         if (!product) throw new Error("Invalid product in cart");
-        if (product.stock < quantity) {
+        if (product.stock < item.quantity) {
           throw new Error(`${product.name} has only ${product.stock} left`);
         }
 
-        return {
-          product: product._id,
-          name: product.name,
-          price: product.price,
-          quantity,
-          image: product.image,
-        };
-      })
-    );
-
-    const totalPrice = orderItems.reduce(
-      (sum, item) => sum + item.price * item.quantity,
-      0
-    );
-
-    const transactionUUID = uuidv4();
-
-    const response = await axios.post(
-      "https://dev.khalti.com/api/v2/epayment/initiate/",
-      {
-        return_url: `http://localhost:5173/payment-success?transactionUUID=${transactionUUID}`,
-        website_url: "http://localhost:5173",
-        amount: totalPrice * 100,
-        purchase_order_id: transactionUUID,
-        purchase_order_name: "Order via Khalti",
-        customer_info: {
-          name: deliveryInfo.name,
-          email: deliveryInfo.email,
-          phone: deliveryInfo.phone,
-        },
-      },
-      {
-        headers: {
-          Authorization: `Key ${KHALTI_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
+        product.stock -= item.quantity;
+        await product.save();
       }
-    );
 
-    return res.status(200).json({
-      ...response.data,
-      tempOrder: {
-        userId,
-        items: orderItems,
+      // Extract from tempOrder (assuming structure matches your Order model)
+      const { items, deliveryInfo, totalPrice } = tempOrder;
+
+      const newOrder = await Order.create({
+        user: req.user.id,
+        items,
         deliveryInfo,
         totalPrice,
-        transactionUUID,
-      },
-    });
-  } catch (err) {
-    console.error("Khalti Init Error", err.response?.data || err.message);
-    return res.status(500).json({ message: "Failed to initiate Khalti" });
-  }
-});
-
-// GET /api/orders/esewa/success
-router.post("/khalti/verify-and-save", authenticate, async (req, res) => {
-  const { pidx, tempOrder } = req.body;
-
-  try {
-    const response = await axios.post(
-      "https://dev.khalti.com/api/v2/epayment/lookup/",
-      { pidx },
-      {
-        headers: {
-          Authorization: `Key ${KHALTI_SECRET_KEY}`,
-        },
-      }
-    );
-
-    const data = response.data;
-    for (const item of tempOrder.items) {
-      const product = await Product.findById(item.product);
-
-      if (!product) throw new Error("Invalid product in cart");
-      if (product.stock < item.quantity) {
-        throw new Error(`${product.name} has only ${product.stock} left`);
-      }
-
-      product.stock -= item.quantity;
-      await product.save();
-    }
-
-    if (data.status === "Completed") {
-      const order = new Order({
-        user: tempOrder.userId,
-        items: tempOrder.items,
-        deliveryInfo: tempOrder.deliveryInfo,
         paymentMethod: "Khalti",
-        totalPrice: tempOrder.totalPrice,
         paymentStatus: "Paid",
-        transactionUUID: tempOrder.transactionUUID,
+        orderStatus: "Processing",
+        transactionUUID: paymentInfo.transaction_id || paymentInfo.pidx, // use actual txn ID if available
       });
 
-      await order.save();
-
-      return res
-        .status(201)
-        .json({ message: "Order placed", orderId: order._id });
-    } else {
-      return res.status(400).json({ message: "Payment not completed" });
+      return res.status(201).json({
+        message: "Order placed successfully",
+        order: newOrder,
+        // transactionDetails: {
+        //   pidx: paymentInfo.pidx,
+        //   transaction_id: paymentInfo.transaction_id,
+        //   total_amount: paymentInfo.total_amount,
+        //   status:paymentInfo.status,
+        // },
+      });
+    } catch (error) {
+      console.error(
+        "Khalti verify error:",
+        error.response?.data || error.message
+      );
+      return res.status(500).json({
+        message: "Failed to verify Khalti payment",
+        error: error.response?.data || error.message,
+      });
     }
-  } catch (err) {
-    console.error("Khalti Verify Error:", err);
-    return res.status(500).json({ message: "Failed to verify Khalti payment" });
-  }
-});
+  });
 
 router.get("/my-orders", authenticate, async (req, res) => {
   try {
@@ -330,3 +359,13 @@ router.get("/all", authenticate, authorizeRoles("Admin"), async (req, res) => {
 });
 
 module.exports = router;
+// if (data.status === "Completed") {
+//       const order = new Order({
+//         user: tempOrder.userId,
+//         items: tempOrder.items,
+//         deliveryInfo: tempOrder.deliveryInfo,
+//         paymentMethod: "Khalti",
+//         totalPrice: tempOrder.totalPrice,
+//         paymentStatus: "Paid",
+//         transactionUUID: tempOrder.transactionUUID,
+//       });
